@@ -37,6 +37,23 @@ protocol CaptureConsuming: Sendable {
     func handleFrame(_ frame: Frame)
 }
 
+struct RecordingAvailability {
+    private(set) var unavailable = false
+
+    mutating func finalizationFailed(_ error: Error) {
+        let failure = error as NSError
+        unavailable = failure.domain != "serve-sim-recording" || ![13, 17].contains(failure.code)
+    }
+
+    func checkStart() throws {
+        guard !unavailable else {
+            throw NSError(domain: "serve-sim-recording", code: 11, userInfo: [
+                NSLocalizedDescriptionKey: "The recording encoder did not stop cleanly; restart serve-sim before recording again"
+            ])
+        }
+    }
+}
+
 actor CaptureConsumer<E: FrameEncoder>: CaptureConsuming {
     nonisolated let continuation: AsyncStream<Frame>.Continuation
 
@@ -100,6 +117,11 @@ actor CaptureEngine {
     private var webRTCEncodeCanvas = Dimensions(width: 0, height: 0)
     /// The shared H.264 canvas the publisher encodes at, as last reported.
     private var viewerCanvas = Dimensions(width: 0, height: 0)
+    private var recording: NativeVideoRecorder?
+    private var recordingStarting = false
+    private var recordingFinalizing = false
+    private var recordingFinishTask: Task<NativeRecordingResult, Error>?
+    private var recordingAvailability = RecordingAvailability()
     private var lastViewerCanvasSequence: UInt64?
     private var frameContinuation: AsyncStream<Frame>.Continuation?
     private var cancelledWebRTCSessionIds = Set<String>()
@@ -406,9 +428,20 @@ actor CaptureEngine {
         await frameCapture.subscribeScreenChanges(callback)
     }
 
-    func stop() async {
+    func stop() async throws {
         if phase == .stopped { return }
         phase = .stopped
+        var recordingError: Error?
+        if let recording {
+            let finishing = recordingFinishTask ?? Task { try await recording.finish() }
+            recordingFinishTask = finishing
+            do {
+                _ = try await finishing.value
+            } catch {
+                recordingError = error
+            }
+        }
+        recording = nil
         nativeFrameDeliveryGeneration &+= 1
         nativeFrameDeliveryPending = false
         nativeFrameDeliveryActive = false
@@ -420,6 +453,67 @@ actor CaptureEngine {
         consumers.removeAll()
         avccEncoders.removeAll()
         await frameCapture.stop()
+        if let recordingError { throw recordingError }
+    }
+
+    func startRecording(outputDirectory: String) async throws {
+        guard phase == .running else {
+            throw recordingError(10, "Capture is not running; start the simulator session and retry")
+        }
+        try recordingAvailability.checkStart()
+        guard recording == nil, !recordingStarting, !recordingFinalizing else {
+            throw recordingError(12, "A recording is already active; stop it before starting another")
+        }
+        recordingStarting = true
+        defer { recordingStarting = false }
+        guard let delivery = await startNativeFrameDelivery() else {
+            throw recordingError(13, "The native simulator display is unavailable; check that the device is booted and retry")
+        }
+        guard phase == .running else {
+            await stopNativeFrameDelivery()
+            throw recordingError(14, "Capture stopped before recording could start; restart the session and retry")
+        }
+        do {
+            let recorder = try NativeVideoRecorder(
+                mailbox: delivery.mailbox, canvas: delivery.canvas,
+                outputDirectory: outputDirectory
+            )
+            recording = recorder
+            recorder.start()
+        } catch {
+            await stopNativeFrameDelivery()
+            throw error
+        }
+    }
+
+    func stopRecording() async throws -> String {
+        guard let recording else {
+            throw recordingError(15, "No recording is active; start recording before stopping it")
+        }
+        recordingFinalizing = true
+        let finishing = recordingFinishTask ?? Task { try await recording.finish() }
+        recordingFinishTask = finishing
+        do {
+            let result = try await finishing.value
+            self.recording = nil
+            await stopNativeFrameDelivery()
+            recordingFinalizing = false
+            recordingFinishTask = nil
+            print("[recording] encoder=\(result.encoderID) encoded=\(result.encodedFrames) written=\(result.writtenFrames) repeated=\(result.repeatedFrames) dropped=\(result.droppedTicks) coalesced=\(result.coalescedDrops) sourceUnavailable=\(result.sourceUnavailableTicks) transferPool=\(result.transferPoolDrops) inFlight=\(result.inFlightDrops) writer=\(result.writerDrops) backpressure=\(result.writerBackpressureTicks) encodeFailures=\(result.encodeFailures) maxInFlight=\(result.maxInFlight) meanEncodeMs=\(result.meanEncodeMs) maxEncodeMs=\(result.maxEncodeMs)")
+            return result.manifestPath
+        } catch {
+            self.recording = nil
+            recordingAvailability.finalizationFailed(error)
+            await stopNativeFrameDelivery()
+            recordingFinalizing = false
+            recordingFinishTask = nil
+            throw error
+        }
+    }
+
+    private func recordingError(_ code: Int, _ message: String) -> NSError {
+        NSError(domain: "serve-sim-recording", code: code,
+                userInfo: [NSLocalizedDescriptionKey: message])
     }
 
     private func getWebRTCPublisher() -> WebRTCPublisher {

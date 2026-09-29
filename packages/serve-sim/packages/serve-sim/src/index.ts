@@ -10,6 +10,7 @@ import WebSocket from "ws";
 import {
   stateDir,
   stateFileForDevice,
+  recordingShutdownFailureFile,
   listStateFiles,
   inProcessServeSimState,
   previewStartupPayload,
@@ -63,6 +64,8 @@ import { parseIceUrlList, streamHelperArgs, streamSettingsEqual } from "./stream
 import { MAX_MJPEG_STREAM_FPS, MAX_VIDEO_STREAM_FPS } from "./stream-settings";
 import { parseHingeAngle } from "./hinge-angle";
 import { sendHingeAngleToWs } from "./hinge-command";
+import { finishDeviceRecordingsForShutdown } from "./device-session";
+import { recordingShutdownGraceMs, stopForStreamReplacement, stopProcess } from "./stop-process";
 
 // `import.meta.dir` is Bun-only; resolve once via fileURLToPath so the bundled
 // CLI works under plain `node` too.
@@ -88,6 +91,19 @@ function resolveVersion(): string {
 // and we extract the bytes to a cached location on first use.
 
 type ServerState = ServeSimDeviceState;
+let replacementRecordingFailed = false;
+
+async function replaceHelper(state: ServerState): Promise<void> {
+  const result = await stopForStreamReplacement(state);
+  if (result.forced) {
+    console.error(`Previous serve-sim helper ${state.pid} required SIGKILL during stream-settings replacement.`);
+  }
+  if (result.recordingError) {
+    replacementRecordingFailed = true;
+    process.exitCode = 1;
+    console.error(`Recording finalization failed while replacing helper ${state.pid}: ${result.recordingError}. Starting the replacement helper.`);
+  }
+}
 
 type StreamRuntimeOptions = StreamSettings;
 function ensureStateDir() {
@@ -305,25 +321,6 @@ function isProcessAlive(pid: number): boolean {
   try { process.kill(pid, 0); return true; } catch { return false; }
 }
 
-/** Kill a process and wait for it to actually exit. */
-function stopProcess(pid: number): void {
-  try { process.kill(pid, "SIGTERM"); } catch { return; }
-  const deadline = Date.now() + 500;
-  while (Date.now() < deadline) {
-    try {
-      process.kill(pid, 0);
-      sleepSync(25);
-    } catch {
-      return;
-    }
-  }
-  try { process.kill(pid, "SIGKILL"); } catch {}
-  const deadline2 = Date.now() + 500;
-  while (Date.now() < deadline2) {
-    try { process.kill(pid, 0); sleepSync(25); } catch { return; }
-  }
-}
-
 function bootDevice(udid: string): void {
   if (!isDeviceBooted(udid)) {
     try {
@@ -479,7 +476,7 @@ async function startHelper(
   // The child boots the sim then writes its state once it's bound + serving.
   const state = await waitForStateFile(udid);
   if (!state) {
-    if (child.pid) stopProcess(child.pid);
+    if (child.pid) await stopProcess(child.pid, child);
     let log = "";
     try { log = readFileSync(logFile, "utf-8").trim(); } catch {}
     console.error(log ? `Preview server failed:\n${log}` : "Preview server failed to start");
@@ -524,7 +521,7 @@ async function follow(
     const existing = readState(udid);
     if (existing) {
       if (replaceMismatchedStream && !streamSettingsEqual(existing.streamSettings, stream)) {
-        stopProcess(existing.pid);
+        await replaceHelper(existing);
         clearState(udid);
       } else {
         if (!quiet) {
@@ -588,14 +585,23 @@ async function follow(
     if (!quiet) console.log("\nShutting down...");
     logBufferCache.stopAll();
     crashRuntime.stop();
-    for (const [udid, child] of children) {
+    const stopped = await Promise.all([...children].map(async ([udid, child]) => {
       const pid = child.pid;
-      if (pid) stopProcess(pid);
+      const state = states.find(current => current.device === udid);
+      const graceMs = state
+        ? await recordingShutdownGraceMs(
+            state.streamUrl.replace(/\/stream\.mjpeg$/, "/recording/video"), state.token,
+          )
+        : undefined;
+      const result = pid ? await stopProcess(pid, child, graceMs) : { exitCode: null, signalCode: null, forced: false };
       clearState(udid);
-    }
+      return result;
+    }));
     await disarmDevicesArmedHereAsync();
     children.clear();
-    process.exit(exitCode);
+    const childFailed = stopped.some(({ exitCode: childCode, signalCode, forced }) =>
+      forced || signalCode !== null || (childCode !== null && childCode !== 0));
+    process.exit(childFailed || replacementRecordingFailed ? 1 : exitCode);
   };
 
   // Monitor children — exit when all die (helper crashed / exited on its own)
@@ -657,7 +663,7 @@ async function detach(
     const existing = readState(udid);
     if (existing) {
       if (replaceMismatchedStream && !streamSettingsEqual(existing.streamSettings, stream)) {
-        stopProcess(existing.pid);
+        await replaceHelper(existing);
         clearState(udid);
       } else {
         states.push(existing);
@@ -1854,11 +1860,27 @@ async function serve(
     console.log("");
   }
 
+  let shuttingDown = false;
   const shutdown = async () => {
+    if (shuttingDown) return;
+    shuttingDown = true;
     sessionStopping = true;
+    const recordingErrors: string[] = [];
+    const recordingsFinished = await finishDeviceRecordingsForShutdown(
+      error => recordingErrors.push(String(error))
+    );
+    if (!recordingsFinished) {
+      try {
+        writeFileSync(recordingShutdownFailureFile(process.pid), JSON.stringify({
+          pid: process.pid, errors: recordingErrors,
+        }), { mode: 0o600 });
+      } catch (error) {
+        console.error(`Could not report recording shutdown failure: ${String(error)}`);
+      }
+    }
     await disarmDevicesArmedHereAsync();
     clearAll();
-    process.exit(0);
+    process.exit(recordingsFinished ? 0 : 1);
   };
   process.on("SIGINT", shutdown);
   process.on("SIGTERM", shutdown);
@@ -2283,6 +2305,152 @@ Examples:
   });
 
 const deviceOpt = ["-d, --device <udid>", "Target a specific simulator (udid or name)"] as const;
+
+async function waitForRecordingManifest(path: string, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (!existsSync(path) && Date.now() < deadline) {
+    await new Promise(resolve => setTimeout(resolve, 250));
+  }
+  return existsSync(path);
+}
+
+async function waitForServerExit(pid: number, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try { process.kill(pid, 0); } catch { return true; }
+    await new Promise(resolve => setTimeout(resolve, 250));
+  }
+  try { process.kill(pid, 0); } catch { return true; }
+  return false;
+}
+
+async function recordVideo(udid: string, output: string): Promise<void> {
+  const state = readState(udid);
+  if (!state) throw new Error(`No running serve-sim session found for ${udid}; start serve-sim for this device and retry.`);
+  const url = state.streamUrl.replace(/\/stream\.mjpeg$/, "/recording/video");
+  const outputDirectory = resolve(output);
+  const manifestPath = join(outputDirectory, "session.json");
+  if (existsSync(manifestPath)) {
+    throw new Error(`Recording manifest already exists at ${manifestPath}; choose an empty output directory.`);
+  }
+  const recordingId = randomBytes(16).toString("hex");
+  const headers: Record<string, string> = { "x-recording-id": recordingId };
+  if (state.token) headers.Authorization = `Bearer ${state.token}`;
+  let resolveStop: () => void = () => {};
+  const stopping = new Promise<void>((resolve) => { resolveStop = resolve; });
+  let stopRequested = false;
+  let recordingStarted = false;
+  const startAbort = new AbortController();
+  const onSignal = () => {
+    stopRequested = true;
+    if (!recordingStarted) startAbort.abort();
+    resolveStop();
+  };
+  const keepAlive = setInterval(() => {}, 60_000);
+  let heartbeat: ReturnType<typeof setInterval> | undefined;
+  let recordingStopStarted = false;
+  let rejectLease: (error: Error) => void = () => {};
+  const lostLease = new Promise<never>((_, reject) => { rejectLease = reject; });
+  void lostLease.catch(() => {});
+  let finished = false;
+  let startupCancellationDelivered = false;
+  process.on("SIGINT", onSignal);
+  process.on("SIGTERM", onSignal);
+  try {
+    try {
+      const start = await fetch(url, {
+        method: "POST",
+        headers: { ...headers, "Content-Type": "application/json" },
+        body: JSON.stringify({ start: true, output: outputDirectory, recordingId }),
+        signal: AbortSignal.any([AbortSignal.timeout(30_000), startAbort.signal]),
+      });
+      if (!start.ok) {
+        throw new Error(`Recording start failed (${start.status}): ${await start.text()}`);
+      }
+    } catch (error) {
+      if (!stopRequested) throw error;
+      const cancelled = await fetch(url, {
+        method: "DELETE", headers, signal: AbortSignal.timeout(120_000),
+      });
+      startupCancellationDelivered = true;
+      if (cancelled.status === 200) {
+        const result = await cancelled.json() as { manifest?: string };
+        if (result.manifest === manifestPath && await waitForRecordingManifest(manifestPath, 120_000)) {
+          finished = true;
+          console.log(manifestPath);
+          return;
+        }
+      }
+      throw new Error(`Recording start was interrupted before a video was saved: ${String(error)}`);
+    }
+    recordingStarted = true;
+    console.error("serve-sim:recording-started");
+    heartbeat = setInterval(() => {
+      if (recordingStopStarted) return;
+      void fetch(url, { method: "PUT", headers, signal: AbortSignal.timeout(10_000) })
+        .then(async response => {
+          if (!response.ok && !recordingStopStarted) rejectLease(new Error(`Recording lease was lost (${response.status}): ${await response.text()}`));
+        })
+        .catch(error => {
+          if (!recordingStopStarted) rejectLease(error instanceof Error ? error : new Error(String(error)));
+        });
+    }, 5_000);
+    let stopError: unknown;
+    let stopRequestAmbiguous = false;
+    try {
+      await Promise.race([stopping, lostLease]);
+      recordingStopStarted = true;
+      clearInterval(heartbeat);
+      heartbeat = undefined;
+      let stop: Response;
+      try {
+        stop = await fetch(url, {
+          method: "DELETE",
+          headers,
+          signal: AbortSignal.timeout(120_000),
+        });
+      } catch (error) {
+        // The server may finish after a transport error or timeout.
+        stopRequestAmbiguous = true;
+        throw error;
+      }
+      if (!stop.ok) throw new Error(`Recording stop failed (${stop.status}): ${await stop.text()}`);
+      const result = await stop.json() as { manifest?: string };
+      if (result.manifest !== manifestPath) {
+        throw new Error("Recording stop returned an unexpected manifest path");
+      }
+    } catch (error) {
+      stopError = error;
+    }
+    if (stopError && !stopRequestAmbiguous) throw stopError;
+    if (!await waitForRecordingManifest(manifestPath, 120_000)) {
+      throw stopError ?? new Error("Recording stopped without a session.json manifest; inspect the serve-sim session log and retry.");
+    }
+    if (stopError && !stopRequested && !await waitForServerExit(state.pid, 5_000)) {
+      throw new Error(`Recording ended before a stop was requested: ${String(stopError)}. A partial video is available at ${manifestPath}.`);
+    }
+    finished = true;
+    console.log(manifestPath);
+  } finally {
+    recordingStopStarted = true;
+    if (heartbeat) clearInterval(heartbeat);
+    if (!finished && !startupCancellationDelivered) {
+      try {
+        await fetch(url, { method: "DELETE", headers, signal: AbortSignal.timeout(10_000) });
+      } catch {}
+    }
+    clearInterval(keepAlive);
+    process.off("SIGINT", onSignal);
+    process.off("SIGTERM", onSignal);
+  }
+}
+
+program
+  .command("record-video")
+  .description("Record native-size hardware H.264 simulator video until SIGINT")
+  .requiredOption("--udid <udid>", "Simulator UDID")
+  .requiredOption("--output <dir>", "Output directory")
+  .action(async (opts: { udid: string; output: string }) => recordVideo(opts.udid, opts.output));
 
 program
   .command("gesture")
