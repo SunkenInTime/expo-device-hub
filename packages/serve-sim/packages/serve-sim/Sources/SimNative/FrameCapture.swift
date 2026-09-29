@@ -119,6 +119,13 @@ actor FrameCapture {
             throw makeError(2, "Device not booted (state: \(state))")
         }
 
+        // Drop this device's CoreDevice capabilities from the previous boot
+        // before HID or display election asks for capabilities from this boot.
+        if SimulatorDisplayProfile.read(from: device).resetsBootBoundStateOnCapture(fixedScreenID: screenID) {
+            await CoreDeviceBridge.shared.resetForNewCapture(udid: deviceUDID)
+            guard generation == captureGeneration else { throw CancellationError() }
+        }
+
         guard let io = device.perform(NSSelectorFromString("io"))?.takeUnretainedValue() as? NSObject else {
             throw makeError(3, "Failed to get device IO")
         }
@@ -130,6 +137,7 @@ actor FrameCapture {
         // during a native display handoff, without waiting for that election.
         let integratedIDs = Set(screenMetadata.values.filter { $0.screenType == 0 }.map(\.screenID))
         if fixedScreenID == nil, integratedIDs.count == 2 {
+            // Only foldable main feeds use CoreDevice display election.
             let displays = try? await CoreDeviceDisplayInfo.read(udid: deviceUDID)
             guard generation == captureGeneration else { throw CancellationError() }
             if let displays {
