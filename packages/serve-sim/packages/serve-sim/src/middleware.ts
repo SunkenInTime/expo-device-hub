@@ -13,6 +13,7 @@ import type { Socket } from "net";
 // lines, and `serve-sim/middleware` is embedded in third-party dev servers, so
 // importing the dependency keeps the proxy working regardless of runtime.
 import { WebSocket } from "ws";
+import { saveScreenshotArtifact, type ScreenshotOutcome } from "./screenshot-artifacts";
 import { createAxStreamerCache } from "./ax";
 import { readCameraStatus } from "./camera-helper";
 import { captureRuntime, rebootedWithCaptureSince, startCaptureForDevice, type CaptureRuntime } from "./capture";
@@ -35,6 +36,7 @@ import {
 } from "./session-auth";
 import {
   eventLogEventForAction,
+  eventLogEventForScreenshot,
   readEventLog,
   recordEventLogEvent,
   subscribeEventLog,
@@ -178,6 +180,14 @@ function recordActionEvent(
     if (event) recordEventLogEvent(event);
   } catch {
     // Event-log recording is diagnostic; it must never break the action path.
+  }
+}
+
+function recordScreenshotEvent(udid: string, outcome: ScreenshotOutcome): void {
+  try {
+    recordEventLogEvent(eventLogEventForScreenshot(udid, outcome));
+  } catch {
+    // Event-log recording is diagnostic; it must never break the screenshot response.
   }
 }
 
@@ -2815,6 +2825,7 @@ export function simMiddleware(options?: SimMiddlewareOptions): SimMiddleware {
           );
         });
         const png = await readFile(file);
+        recordScreenshotEvent(udid, await saveScreenshotArtifact(png));
         res.writeHead(200, {
           "Cache-Control": "no-store",
           "Content-Type": "image/png",
@@ -2825,6 +2836,9 @@ export function simMiddleware(options?: SimMiddlewareOptions): SimMiddleware {
         const message =
           (typeof stderr === "string" && stderr.trim()) ||
           (err instanceof Error ? err.message : String(err));
+        // The event log is browser-readable; simctl's stderr can name host paths, so it stays here.
+        console.error(`simctl screenshot failed for ${udid}:`, message);
+        recordScreenshotEvent(udid, { status: "capture-failed", error: "simctl screenshot failed" });
         res.writeHead(500, {
           "Cache-Control": "no-store",
           "Content-Type": "application/json",
