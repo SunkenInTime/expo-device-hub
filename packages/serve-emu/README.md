@@ -368,8 +368,8 @@ curl -X POST "$BASE/api/key" -H 'Content-Type: application/json' -d '{"keycode":
 ### Inspection
 
 ```sh
-curl "$BASE/api/screenshot" --output screen.png
-curl "$BASE/api/screenshot?format=base64"
+curl -X POST "$BASE/api/screenshot" --output screen.png
+curl -X POST "$BASE/api/screenshot?format=base64"
 curl "$BASE/api/foreground"
 curl "$BASE/api/accessibility"
 curl -X POST "$BASE/api/accessibility/tap" \

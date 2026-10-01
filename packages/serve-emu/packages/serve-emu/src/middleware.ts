@@ -1604,7 +1604,7 @@ async function createAppInternal(
     }
 
     if (url.pathname === "/api/screenshot") {
-      if (req.method !== "GET" && req.method !== "POST") {
+      if (req.method !== "POST") {
         return new Response("method not allowed", { status: 405 });
       }
       try {
@@ -3119,6 +3119,11 @@ export function createRouter(
       url.pathname === "/webrtc/close";
     if (!deviceScoped) {
       return serveStaticFile(url.pathname) ?? new Response("not found", { status: 404 });
+    }
+
+    // Capture has side effects, so the method gate runs before ensure() resolves or starts a device.
+    if (url.pathname === "/api/screenshot" && req.method !== "POST") {
+      return new Response("method not allowed", { status: 405 });
     }
 
     // Everything else operates on a single device.
