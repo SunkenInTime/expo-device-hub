@@ -1,12 +1,13 @@
-import { type ComponentType } from 'react';
+import { type ComponentType, useEffect, useRef, useState } from 'react';
 
 import {
   type AgentInteraction,
   type DeviceClient,
   type DeviceScreenProps,
   type ScreenSize,
+  type ScreenshotArtifact,
 } from '@expo/hub-client';
-import { bg, border } from '../primitives';
+import { bg, border, text, textSize } from '../primitives';
 import { type Device } from './data';
 import { DEVICE_TITLE_HEIGHT, DeviceTitle } from './DeviceTitle';
 import { type DeviceFrameAssets } from './deviceFrame';
@@ -36,6 +37,38 @@ function screenshotFilename(name: string): string {
   const slug = name.trim().replace(/[^a-zA-Z0-9._-]+/g, '-').replace(/^-+|-+$/g, '') || 'device';
   const stamp = new Date().toISOString().replace(/[:.]/g, '-').replace(/Z$/, '');
   return `${slug}-${stamp}.png`;
+}
+
+/** How long the session artifact notice stays under the controls after a download. */
+const SCREENSHOT_NOTICE_MS = 6000;
+
+/**
+ * The session artifact notice above the controls; nothing outside an EAS session or for an older
+ * backend. It lives in the gap between the frame and the toolbar, which the viewport reserves, so
+ * the panel never clips it; two lines at this line height still fit the gap.
+ */
+export function ScreenshotArtifactNotice({ artifact }: { artifact: ScreenshotArtifact | null }) {
+  if (artifact?.status !== 'saved' && artifact?.status !== 'failed') return null;
+  const failed = artifact.status === 'failed';
+  return (
+    <span
+      role="status"
+      aria-live="polite"
+      style={{
+        ...textSize.xs,
+        lineHeight: 1.3,
+        display: 'block',
+        maxWidth: 360,
+        margin: '0 auto 4px',
+        textAlign: 'center',
+        overflowWrap: 'anywhere',
+        color: failed ? text.warning : text.tertiary,
+      }}>
+      {failed
+        ? `Downloaded. Not saved to session artifacts${artifact.error ? `: ${artifact.error}` : ''}`
+        : 'Saved to session artifacts'}
+    </span>
+  );
 }
 
 /**
@@ -75,6 +108,12 @@ export function StreamPanel({
   /** Consumer-owned frame artwork keyed by the selected device's frame kind. */
   deviceFrameAssets?: DeviceFrameAssets;
 }) {
+  const [screenshotArtifact, setScreenshotArtifact] = useState<ScreenshotArtifact | null>(null);
+  const noticeTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => () => {
+    if (noticeTimer.current) clearTimeout(noticeTimer.current);
+  }, []);
+
   return (
     <section
       style={{
@@ -133,13 +172,19 @@ export function StreamPanel({
             <DeviceTitle key={device.id} device={device} status={client.status} recording={client.screenRecording} />
           </div>
           <div
+            data-testid="stream-controls-band"
             style={{
               position: 'absolute',
               left: '50%',
-              top: `calc(100% + ${CONTROLS_GAP}px)`,
+              top: '100%',
+              height: STREAM_CONTROLS_HEIGHT + CONTROLS_GAP,
               width: 'max-content',
               transform: 'translateX(-50%)',
+              display: 'flex',
+              flexDirection: 'column',
+              justifyContent: 'flex-end',
             }}>
+            <ScreenshotArtifactNotice artifact={screenshotArtifact} />
             <StreamControls
               recording={client.screenRecording}
               appearance={client.appearance}
@@ -150,8 +195,12 @@ export function StreamPanel({
               onReload={() => client.reload()}
               onRotate={() => client.rotate()}
               onSave={async () => {
-                const blob = await client.screenshot();
-                if (blob) downloadBlob(blob, screenshotFilename(device.name));
+                const capture = await client.screenshot();
+                if (!capture) return;
+                downloadBlob(capture.blob, screenshotFilename(device.name));
+                if (noticeTimer.current) clearTimeout(noticeTimer.current);
+                setScreenshotArtifact(capture.artifact);
+                noticeTimer.current = setTimeout(() => setScreenshotArtifact(null), SCREENSHOT_NOTICE_MS);
               }}
             />
           </div>
