@@ -1,6 +1,7 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { randomUUID } from "crypto";
 import { execFileSync, spawn, spawnSync, type ChildProcess } from "child_process";
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync } from "fs";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "fs";
 import { join } from "path";
 import { homedir, tmpdir } from "os";
 
@@ -16,6 +17,7 @@ const BUNDLE_ID = "dev.expo.serve-sim.crash-fixture";
 const PKG_DIR = join(import.meta.dir, "../..");
 const CLI = join(PKG_DIR, "dist/serve-sim.js");
 const FIXTURE = join(PKG_DIR, "dist/capability-loader/ServeSimCrashFixture.app");
+const REPORTS_DIR = join(homedir(), "Library/Logs/DiagnosticReports");
 
 async function waitFor<T>(
   read: () => Promise<T | null>,
@@ -29,8 +31,8 @@ async function waitFor<T>(
     await new Promise((resolve) => setTimeout(resolve, 250));
   }
   throw new Error(
-    `Timed out after ${timeoutMs}ms waiting for ${description}. Verify the simulator is still ` +
-      "booted, then inspect the serve-sim output and macOS DiagnosticReports directory.",
+    `Timed out after ${timeoutMs}ms waiting for ${description}. ` +
+      "Inspect the serve-sim output and macOS DiagnosticReports directory.",
   );
 }
 
@@ -47,17 +49,37 @@ function launchFixture(udid: string): number {
   return pid;
 }
 
+function seedReport(report: string, pid: number, capturedAt: string): string {
+  const incidentId = randomUUID();
+  const separator = report.indexOf("\n");
+  if (separator < 0) throw new Error("OS crash report has no header line");
+  const header = JSON.parse(report.slice(0, separator)) as Record<string, unknown>;
+  const body = JSON.parse(report.slice(separator + 1)) as Record<string, unknown>;
+  header.incident_id = incidentId;
+  header.timestamp = capturedAt;
+  body.pid = pid;
+  body.captureTime = capturedAt;
+  const name = `${APP_NAME}-${incidentId}.ips`;
+  const temporaryPath = join(REPORTS_DIR, `.${name}`);
+  const reportPath = join(REPORTS_DIR, name);
+  // ReportCrash writes a hidden temporary file, then renames it when complete.
+  writeFileSync(temporaryPath, `${JSON.stringify(header)}\n${JSON.stringify(body)}\n`);
+  renameSync(temporaryPath, reportPath);
+  return reportPath;
+}
+
 const udid = e2eDevice();
 const ready = udid !== null && existsSync(CLI) && existsSync(FIXTURE);
 
 requireE2E("real crash ingestion", ready);
 
-describe.skipIf(!ready)("crash ingestion (real simulator app and built CLI)", () => {
+describe.skipIf(!ready)("crash ingestion (real app, OS report, and seeded recurrence)", () => {
   let server: ChildProcess | null = null;
   let tempDir = "";
   let baseUrl = "";
   let startedAt = 0;
   const launchedPids: number[] = [];
+  const seededReports: string[] = [];
 
   beforeAll(async () => {
     startedAt = Date.now();
@@ -83,12 +105,10 @@ describe.skipIf(!ready)("crash ingestion (real simulator app and built CLI)", ()
   afterAll(() => {
     server?.kill("SIGKILL");
     spawnSync("xcrun", ["simctl", "uninstall", udid!, BUNDLE_ID], { stdio: "ignore" });
-    const reportsDir = join(homedir(), "Library/Logs/DiagnosticReports");
-    for (const dir of [reportsDir, join(reportsDir, "Retired")]) {
+    for (const path of seededReports) rmSync(path, { force: true });
+    for (const dir of [REPORTS_DIR, join(REPORTS_DIR, "Retired")]) {
       let names: string[] = [];
-      try {
-        names = readdirSync(dir);
-      } catch {}
+      try { names = readdirSync(dir); } catch {}
       for (const name of names) {
         if (!name.startsWith(`${APP_NAME}-`)) continue;
         const path = join(dir, name);
@@ -102,7 +122,7 @@ describe.skipIf(!ready)("crash ingestion (real simulator app and built CLI)", ()
     if (tempDir) rmSync(tempDir, { recursive: true, force: true });
   });
 
-  test("ingests, groups, and serves OS-written crash reports", async () => {
+  test("ingests an OS-written crash and groups a seeded recurrence", async () => {
     // Reading once starts the real DiagnosticReports watcher before the app exits.
     const initial = await fetch(`${baseUrl}/crashes?device=${encodeURIComponent(udid!)}`);
     expect(initial.status).toBe(200);
@@ -118,7 +138,7 @@ describe.skipIf(!ready)("crash ingestion (real simulator app and built CLI)", ()
       return payload.crashes.find(
         (record) => record.bundleId === BUNDLE_ID && record.pid === firstPid,
       ) ?? null;
-    }, 60_000, "ReportCrash to publish the fixture's first .ips file");
+    }, 60_000, "ReportCrash to publish the fixture's .ips file");
 
     expect(crash).toMatchObject({
       appName: APP_NAME,
@@ -140,9 +160,11 @@ describe.skipIf(!ready)("crash ingestion (real simulator app and built CLI)", ()
     expect(detail.report).toContain(BUNDLE_ID);
     expect(detail.report).toContain(udid!);
     expect(detail.reportError).toBeNull();
+    if (!detail.report) throw new Error("OS crash report detail was empty");
 
-    const secondPid = launchFixture(udid!);
-    launchedPids.push(secondPid);
+    const secondPid = firstPid + 1;
+    seededReports.push(seedReport(detail.report, secondPid, new Date((crash.capturedAtMs ?? Date.now()) + 1000).toISOString()));
+
     const recurred = await waitFor<CrashSummary>(async () => {
       const response = await fetch(`${baseUrl}/crashes?device=${encodeURIComponent(udid!)}`);
       if (!response.ok) return null;
@@ -150,7 +172,7 @@ describe.skipIf(!ready)("crash ingestion (real simulator app and built CLI)", ()
       return payload.crashes.find(
         (record) => record.id === crash.id && record.pid === secondPid && record.count === 2,
       ) ?? null;
-    }, 60_000, "ReportCrash to publish and group the fixture's second .ips file");
+    }, 60_000, "the watcher to ingest and group the fixture's second .ips file");
 
     expect(recurred.occurrenceCount).toBe(2);
     const newestResponse = await fetch(
