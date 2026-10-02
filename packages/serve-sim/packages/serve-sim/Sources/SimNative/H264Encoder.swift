@@ -33,11 +33,26 @@ actor H264Encoder {
     private var emittedDescription = false
     private var frameCount: Int64 = 0
     private var lowLatencyEnabled = true
+    /// Times the encoder fell back from low-latency to default rate control. Nothing turns
+    /// low-latency rate control back on, so it is 0 or 1 for one encoder.
+    private(set) var lowLatencyFallbacks: UInt64 = 0
     private var forceKeyframeAfterReset = false
     private var encodeInFlight = false
     private var pendingSettings: (fps: Int32, bitrate: Int)?
     private let constrainedBaseline: Bool
     private let dynamicBitrate: Bool
+
+    /// Byte and second pairs for the WebRTC shared encoder (dynamic bitrate): the target over one
+    /// second, and 1.5 times it over a tenth of a second. AverageBitRate alone let the first frames
+    /// of a full-screen change run to two or three times WebRTC's target, and libwebrtc answered
+    /// the overshoot by dropping frames before encode for 3 to 5 seconds. The windows count
+    /// presentation time, which `encode` takes from a frame counter at `fps`, not wall time: frames
+    /// that arrive faster than `fps` count as spread out, and slower frames as packed together.
+    private static func dataRateLimits(bitrate: Int) -> CFArray {
+        let bytesPerSecond = Double(bitrate) / 8
+        return [NSNumber(value: bytesPerSecond), NSNumber(value: 1.0),
+                NSNumber(value: bytesPerSecond * 0.15), NSNumber(value: 0.1)] as CFArray
+    }
 
     init(fps: Int = 60, bitrate: Int = 6_000_000,
          constrainedBaseline: Bool = false, dynamicBitrate: Bool = false) {
@@ -93,8 +108,14 @@ actor H264Encoder {
             rebuildSession()
             throw Errors.encodingFailed
         }
+        // VideoToolbox drops the second frame of most low-latency sessions (noErr, no sample,
+        // kVTEncodeInfo_FrameDropped), and that drop lands here too, so most sessions run default
+        // rate control from their second frame. We keep that: on EAS, staying on low-latency rate
+        // control dropped about 12 frames a second in full-screen motion, for a latency gain no
+        // benchmark has measured.
         streamDiagnosticLog("[stream:h264] low-latency encode failed; retrying with default rate control")
         lowLatencyEnabled = false
+        lowLatencyFallbacks &+= 1
         forceKeyframeAfterReset = true
         rebuildSession()
         guard let fallbackSession = self.session else {
@@ -168,6 +189,8 @@ actor H264Encoder {
         if dynamicBitrate, fps == nextFps, let session,
            VTSessionSetProperty(session, key: kVTCompressionPropertyKey_AverageBitRate,
                                 value: NSNumber(value: nextBitrate)) == noErr {
+            VTSessionSetProperty(session, key: kVTCompressionPropertyKey_DataRateLimits,
+                                 value: Self.dataRateLimits(bitrate: nextBitrate))
             bitrate = nextBitrate
             return
         }
@@ -230,12 +253,13 @@ actor H264Encoder {
         if lowLatencyEnabled && (status != noErr || sess == nil) {
             streamDiagnosticLog("[stream:h264] low-latency session unavailable; using default rate control")
             lowLatencyEnabled = false
+            lowLatencyFallbacks &+= 1
             sess = nil
             status = create(spec: nil)
         }
         guard status == noErr, let sess else { return }
 
-        let props: [(CFString, Any)] = [
+        var props: [(CFString, Any)] = [
             (kVTCompressionPropertyKey_RealTime, kCFBooleanTrue!),
             (kVTCompressionPropertyKey_ProfileLevel, constrainedBaseline
                 ? kVTProfileLevel_H264_ConstrainedBaseline_AutoLevel
@@ -249,6 +273,9 @@ actor H264Encoder {
             // don't wait for the natural IDR — we force one on connect.
             (kVTCompressionPropertyKey_MaxKeyFrameInterval, NSNumber(value: fps * 5)),
         ]
+        if dynamicBitrate {
+            props.append((kVTCompressionPropertyKey_DataRateLimits, Self.dataRateLimits(bitrate: bitrate)))
+        }
         for (key, value) in props {
             let propertyStatus = VTSessionSetProperty(sess, key: key, value: value as CFTypeRef)
             if propertyStatus != noErr {

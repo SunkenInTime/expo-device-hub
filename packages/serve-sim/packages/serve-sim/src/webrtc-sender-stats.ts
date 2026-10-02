@@ -50,6 +50,13 @@ export interface CaptureCounts {
   pumpRepeats?: number | null;
   /** Frames with the same pixels as the retained one, so they did not count as fresh. */
   unchangedFrames?: number | null;
+  /** Cumulative timing counters for comparing equal-length windows. */
+  pumpTimerTicks?: number | null;
+  pumpTimerLateSumMs?: number | null;
+  pumpTimerLateMaxMs?: number | null;
+  sourceSubmitCount?: number | null;
+  sourceSubmitSumMs?: number | null;
+  sourceSubmitMaxMs?: number | null;
   cpuFallbacks: number | null;
   poolDrops?: number | null;
   attempts: number | null;
@@ -81,6 +88,8 @@ export interface SharedCanvas {
   steps: number;
   /** Peers that lagged the shared encoder's cache and were restarted with a keyframe. */
   starvedRecoveries?: number | null;
+  /** Times the shared encoder fell back from low-latency to default rate control. */
+  lowLatencyFallbacks?: number | null;
 }
 
 export interface SenderStats {
@@ -202,6 +211,7 @@ function readSharedCanvas(raw: unknown): SharedCanvas | null {
   return {
     width: width as number, height: height as number, scale: scale as number, step: step as number, steps: steps as number,
     starvedRecoveries: maybeNumber(raw.starvedRecoveries),
+    lowLatencyFallbacks: maybeNumber(raw.lowLatencyFallbacks),
   };
 }
 
@@ -230,6 +240,12 @@ function readCaptureCounts(raw: unknown): CaptureCounts | null {
     pumpDeferrals: maybeNumber(raw.pumpDeferrals),
     pumpRepeats: maybeNumber(raw.pumpRepeats),
     unchangedFrames: maybeNumber(raw.unchangedFrames),
+    pumpTimerTicks: maybeNumber(raw.pumpTimerTicks),
+    pumpTimerLateSumMs: maybeNumber(raw.pumpTimerLateSumMs),
+    pumpTimerLateMaxMs: maybeNumber(raw.pumpTimerLateMaxMs),
+    sourceSubmitCount: maybeNumber(raw.sourceSubmitCount),
+    sourceSubmitSumMs: maybeNumber(raw.sourceSubmitSumMs),
+    sourceSubmitMaxMs: maybeNumber(raw.sourceSubmitMaxMs),
     cpuFallbacks: maybeNumber(raw.cpuFallbacks),
     poolDrops: maybeNumber(raw.poolDrops),
     attempts: maybeNumber(raw.attempts),

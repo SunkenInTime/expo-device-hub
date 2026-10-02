@@ -76,8 +76,12 @@ H.264 encoder factory gives each H.264 peer a proxy over one
 `VTCompressionSession`.
 Proxies deduplicate submissions by frame timestamp and distribute the one
 compressed result to the peers. The shared target bitrate is the minimum of
-active peers' requests; a join or PLI requests an IDR. Each peer still owns
-its connection, congestion controller, and RTP packet stream.
+active peers' requests; a join or PLI requests an IDR. `DataRateLimits` hold the
+shared encoder to that target over one second and to 1.5 times it over a tenth
+of a second. With `AverageBitRate` alone, the first frames of a full-screen
+change ran to two or three times the target, and libwebrtc answered by dropping
+frames before encode. Each peer still owns its connection, congestion
+controller, and RTP packet stream.
 If a peer misses a shared delta frame, it waits for the next shared IDR;
 recovery does not replay frames or start another encoder.
 
@@ -96,7 +100,10 @@ frame rate only. VP8 peers use `balanced` and may downscale their own output.
 One constrained H.264 viewer lowers the shared canvas for every viewer.
 `/webrtc/stats` reports the canvas, scale, and step count under `sharedCanvas`,
 the resize counters under `viewerResize`, and the pump deferrals, repeats,
-unchanged frames, and canvas-mismatch drops under `capture`.
+unchanged frames, and canvas-mismatch drops under `capture`. `capture` also
+has cumulative pump timer ticks with their total and largest lateness, and the
+count, total, and largest time of the synchronous submit to libwebrtc, so two
+samples give the averages over the window between them.
 
 Viewer size, rate, bitrate, and negotiated H.264 level affect the live stream,
 not the recording. If the H.264 canvas is not ready or an offered H.264 level cannot decode
