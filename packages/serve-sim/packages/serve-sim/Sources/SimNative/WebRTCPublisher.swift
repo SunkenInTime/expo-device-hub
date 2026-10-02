@@ -95,6 +95,8 @@ struct WebRTCCaptureCounts: Codable {
     /// Pump slots that waited one tolerance for a late frame, and sends that repeated a frame.
     let pumpDeferrals: UInt64?
     let pumpRepeats: UInt64?
+    /// Frames with the same pixels as the retained one, so they did not count as fresh.
+    let unchangedFrames: UInt64?
     let cpuFallbacks: UInt64
     let poolDrops: UInt64
     let attempts: UInt64
@@ -172,6 +174,10 @@ private struct PendingWebRTCOffer {
 final class WebRTCPublisher: @unchecked Sendable {
     private static let signalingTimeoutMs = 10_000
     private static let connectionTimeoutMs = 10_000
+    /// Fresh frames may go out this much faster than the configured rate; repeats keep the rate.
+    /// A capture copy that waits behind the simulator's GPU work releases frames in bursts, and at
+    /// the rate itself the pacer held each fresh frame 2 to 14 ms (median, EAS) for a token.
+    private static let freshFrameRateMultiplier = 1.5
 
     /// The playout-delay extension the sender stamps on every packet. The
     /// default stays min 0 / max 0 — render every frame as soon as it arrives.
@@ -236,6 +242,10 @@ final class WebRTCPublisher: @unchecked Sendable {
     private var viewerResizer: ViewerFrameResizer!
     /// Guarded by `frameLock`: the newest resizer sequence retained for the pump.
     private var lastReadySequence: UInt64 = 0
+    /// Guarded by `frameLock`. The simulator rewrites its surface without new content, 70 to 120
+    /// times a second against 60 app frames on EAS; a frame with the same pixels as the retained
+    /// one does not count as fresh for the pacer.
+    private var unchangedFrameCount: UInt64 = 0
     /// Guarded by `frameLock`: frames the pump refused because their size did not match the canvas.
     private var canvasMismatchDrops: UInt64 = 0
     private var encodeCanvas: Dimensions
@@ -259,7 +269,10 @@ final class WebRTCPublisher: @unchecked Sendable {
         self.frameRatePolicy = frameRatePolicy
         self.targetBitrate = max(100_000, targetBitrate)
         self.maxDimension = max(0, maxDimension)
-        self.framePacer = ContinuousFramePacer(framesPerSecond: normalizedMaxFps)
+        self.framePacer = ContinuousFramePacer(
+            framesPerSecond: normalizedMaxFps, mode: .bucket,
+            freshRateMultiplier: Self.freshFrameRateMultiplier
+        )
         self.rawEncodeCanvas = encodeCanvas
         self.encodeCanvas = Self.canvasSize(for: encodeCanvas, maxDimension: maxDimension)
         h264FrameModeOverride = Self.h264FrameModeOverride()
@@ -570,6 +583,7 @@ final class WebRTCPublisher: @unchecked Sendable {
         let canvasMismatchDrops: UInt64
         let pumpDeferrals: UInt64
         let pumpRepeats: UInt64
+        let unchangedFrames: UInt64
     }
 
     func frameFlowCounts() -> FrameFlowCounts {
@@ -577,11 +591,13 @@ final class WebRTCPublisher: @unchecked Sendable {
         let (offered, forwarded, restarts, mismatches) =
             (offeredFrameCount, forwardedFrameCount, framePumpRestartCount, canvasMismatchDrops)
         let (deferrals, repeats) = (framePacer.deferredTicks, framePacer.repeatedSends)
+        let unchanged = unchangedFrameCount
         frameLock.unlock()
         return FrameFlowCounts(
             offered: offered, forwarded: forwarded, pumpRestarts: restarts,
             sharedEncoded: sharedEncoderFactory.encodedFrameCount(),
-            canvasMismatchDrops: mismatches, pumpDeferrals: deferrals, pumpRepeats: repeats
+            canvasMismatchDrops: mismatches, pumpDeferrals: deferrals, pumpRepeats: repeats,
+            unchangedFrames: unchanged
         )
     }
 
@@ -624,9 +640,52 @@ final class WebRTCPublisher: @unchecked Sendable {
         viewerResizer.submit(pixelBuffer, acceptanceGeneration: generation)
     }
 
+    /// True when both buffers hold the same pixels: the same format and size, and every pixel byte
+    /// of both planes of a 4:2:0 frame (or of a BGRA frame) equal. False for a format it does not
+    /// read, which then counts as changed.
+    private static func samePixels(_ a: CVPixelBuffer, _ b: CVPixelBuffer) -> Bool {
+        let format = CVPixelBufferGetPixelFormatType(a)
+        let planar = format == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+            || format == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
+        guard planar || format == kCVPixelFormatType_32BGRA,
+              CVPixelBufferGetPixelFormatType(b) == format,
+              CVPixelBufferGetWidth(a) == CVPixelBufferGetWidth(b),
+              CVPixelBufferGetHeight(a) == CVPixelBufferGetHeight(b),
+              CVPixelBufferLockBaseAddress(a, .readOnly) == kCVReturnSuccess else { return false }
+        defer { CVPixelBufferUnlockBaseAddress(a, .readOnly) }
+        guard CVPixelBufferLockBaseAddress(b, .readOnly) == kCVReturnSuccess else { return false }
+        defer { CVPixelBufferUnlockBaseAddress(b, .readOnly) }
+        if planar {
+            for plane in 0..<2 {
+                guard let baseA = CVPixelBufferGetBaseAddressOfPlane(a, plane),
+                      let baseB = CVPixelBufferGetBaseAddressOfPlane(b, plane) else { return false }
+                // The chroma plane interleaves Cb and Cr, two bytes per sample.
+                let rowBytes = CVPixelBufferGetWidthOfPlane(a, plane) * (plane == 0 ? 1 : 2)
+                guard FramePlanes.equal(
+                    baseA, bytesPerRow: CVPixelBufferGetBytesPerRowOfPlane(a, plane),
+                    baseB, bytesPerRow: CVPixelBufferGetBytesPerRowOfPlane(b, plane),
+                    rowBytes: rowBytes, rows: CVPixelBufferGetHeightOfPlane(a, plane)
+                ) else { return false }
+            }
+            return true
+        }
+        guard let baseA = CVPixelBufferGetBaseAddress(a), let baseB = CVPixelBufferGetBaseAddress(b) else { return false }
+        return FramePlanes.equal(
+            baseA, bytesPerRow: CVPixelBufferGetBytesPerRow(a),
+            baseB, bytesPerRow: CVPixelBufferGetBytesPerRow(b),
+            rowBytes: CVPixelBufferGetWidth(a) * 4, rows: CVPixelBufferGetHeight(a)
+        )
+    }
+
     /// Resizer output, on the resizer queue: retain the frame for the pump and wake it.
     private func frameReady(_ pixelBuffer: CVPixelBuffer, sequence: UInt64, generation: UInt64) {
         let nowNs = DispatchTime.now().uptimeNanoseconds
+        // Compared outside the lock: only this queue replaces the retained frame, and a clear in
+        // between changes the acceptance generation checked below.
+        frameLock.lock()
+        let previous = latestFrame?.pixelBuffer
+        frameLock.unlock()
+        let unchanged = previous.map { Self.samePixels($0, pixelBuffer) } ?? false
         frameLock.lock()
         guard acceptsFrames, generation == frameAcceptanceGeneration,
               sequence > lastReadySequence else {
@@ -635,8 +694,14 @@ final class WebRTCPublisher: @unchecked Sendable {
         }
         lastReadySequence = sequence
         latestFrame = PendingWebRTCFrame(pixelBuffer: pixelBuffer)
+        // A frame with the same pixels as the retained one does not count as fresh for the pacer,
+        // but it still lets the pacer's watchdog restart a lost chain.
+        if unchanged { unchangedFrameCount &+= 1 }
         let generation = framePumpGeneration
-        switch framePacer.latestFrameArrived(atNanoseconds: nowNs) {
+        let decision = unchanged
+            ? framePacer.unchangedFrameArrived(atNanoseconds: nowNs)
+            : framePacer.latestFrameArrived(atNanoseconds: nowNs)
+        switch decision {
         case .ignore:
             break
         case .pumpNow:

@@ -58,14 +58,21 @@ path. A frame that arrives while one is in flight replaces the waiting frame.
 backend. Metal retains the VideoToolbox fallback; the other two modes use
 only the selected backend.
 
-`WebRTCPublisher` paces the latest resized frame at the configured viewer rate.
-When a 60 Hz source lands a fraction of a millisecond after a slot, the pump
-waits one scheduling tolerance for it instead of repeating the previous frame;
-an idle screen has no cadence and repeats at the configured rate. A frame from
-before a canvas change is dropped at the pump rather than encoded at the wrong
-size. Resized frames from an earlier viewer session are discarded after the
-viewer acceptance generation changes. A custom H.264 encoder factory gives
-each H.264 peer a proxy over one
+`WebRTCPublisher` paces the latest resized frame with a token bucket. A fresh
+frame goes out when it arrives while a token is left. Tokens refill at 1.5
+times the configured viewer rate, so a burst of frames after a late capture copy
+goes out whole instead of the newest replacing the middle one. The previous
+frame repeats at the configured rate: one interval after the last send on an
+idle screen, and 1.5 intervals after it while the source is active, so a late
+fresh frame keeps its token. The simulator rewrites its surface without new
+content, 70 to 120 times a second against 60 app frames on EAS. A resized frame
+with the same pixels as the retained frame (every pixel byte of both planes)
+replaces it but does not count as fresh for the pump, so a rewrite does not take
+the slot of the next real frame. It still lets the pump restart a chain that
+stopped ticking. A frame from before a canvas change is dropped at the pump
+rather than encoded at the wrong size. Resized frames from an earlier viewer
+session are discarded after the viewer acceptance generation changes. A custom
+H.264 encoder factory gives each H.264 peer a proxy over one
 `VTCompressionSession`.
 Proxies deduplicate submissions by frame timestamp and distribute the one
 compressed result to the peers. The shared target bitrate is the minimum of
@@ -88,8 +95,8 @@ H.264 peers keep `maintainResolution`, so libwebrtc adapts their bitrate and
 frame rate only. VP8 peers use `balanced` and may downscale their own output.
 One constrained H.264 viewer lowers the shared canvas for every viewer.
 `/webrtc/stats` reports the canvas, scale, and step count under `sharedCanvas`,
-the resize counters under `viewerResize`, and the pump deferrals, repeats, and
-canvas-mismatch drops under `capture`.
+the resize counters under `viewerResize`, and the pump deferrals, repeats,
+unchanged frames, and canvas-mismatch drops under `capture`.
 
 Viewer size, rate, bitrate, and negotiated H.264 level affect the live stream,
 not the recording. If the H.264 canvas is not ready or an offered H.264 level cannot decode

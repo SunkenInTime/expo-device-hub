@@ -48,6 +48,8 @@ export interface CaptureCounts {
   /** Pump slots that waited one tolerance for a late frame, and sends that repeated a frame. */
   pumpDeferrals?: number | null;
   pumpRepeats?: number | null;
+  /** Frames with the same pixels as the retained one, so they did not count as fresh. */
+  unchangedFrames?: number | null;
   cpuFallbacks: number | null;
   poolDrops?: number | null;
   attempts: number | null;
@@ -227,6 +229,7 @@ function readCaptureCounts(raw: unknown): CaptureCounts | null {
     canvasMismatchDrops: maybeNumber(raw.canvasMismatchDrops),
     pumpDeferrals: maybeNumber(raw.pumpDeferrals),
     pumpRepeats: maybeNumber(raw.pumpRepeats),
+    unchangedFrames: maybeNumber(raw.unchangedFrames),
     cpuFallbacks: maybeNumber(raw.cpuFallbacks),
     poolDrops: maybeNumber(raw.poolDrops),
     attempts: maybeNumber(raw.attempts),
