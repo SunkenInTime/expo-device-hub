@@ -1,3 +1,4 @@
+import { parseAppIconResponse } from './android-app-icon';
 import { type HostActionResult, type RunHostAction } from './exec-ws';
 import { type ForegroundApp } from './types';
 
@@ -24,11 +25,14 @@ export type IosAppDetails = Pick<
  * bundle can't be located (e.g. the process is not a plain app — SpringBoard
  * has no user-visible container on some runtimes). Icons compiled solely into
  * Assets.car yield no `iconDataUrl`; callers should fall back to a placeholder.
+ * With `includeIcon: false` the icon is left to {@link fetchIosAppIcon} and the
+ * result carries no `iconDataUrl` key.
  */
 export async function fetchIosAppDetails(
   run: RunHostAction,
   udid: string,
   bundleId: string,
+  { includeIcon = true }: { includeIcon?: boolean } = {},
 ): Promise<IosAppDetails | null> {
   const ctn: HostActionResult = await run('app.container', { udid, bundleId });
   if (ctn.exitCode !== 0) return null;
@@ -53,7 +57,7 @@ export async function fetchIosAppDetails(
   else if (typeof info?.CFBundleIconFile === 'string') iconName = info.CFBundleIconFile;
 
   let iconDataUrl: string | undefined;
-  if (iconName) {
+  if (includeIcon && iconName) {
     // Loose PNGs commonly sit next to Assets.car under a handful of names.
     const candidates = [
       `${iconName}@3x.png`,
@@ -79,8 +83,67 @@ export async function fetchIosAppDetails(
     build: info.CFBundleVersion,
     minOS: info.MinimumOSVersion,
     executable: info.CFBundleExecutable,
-    iconDataUrl,
+    ...(includeIcon ? { iconDataUrl } : {}),
   };
+}
+
+type FetchImpl = (input: string, init?: RequestInit) => Promise<Response>;
+
+/** Waits before each retry of the icon request. */
+const ICON_RETRY_DELAYS_MS = [1_000, 2_000, 4_000];
+
+/**
+ * The app's icon from serve-sim's `/api/apps/icon` route (`appIconEndpoint` in
+ * `/api`): one plain GET, so it also reaches a tunneled server whose exec-ws
+ * socket the page cannot open. Null when the app has no loose icon PNG.
+ *
+ * Not cached: the route reads the installed bundle on each request, so a
+ * reinstalled build shows its new icon. A network error or a 5xx (the route
+ * answers 503 while simctl fails) is retried a few times. A 4xx is not,
+ * because the same request gets the same answer.
+ */
+export async function fetchIosAppIcon(
+  appIconUrl: string,
+  bundleId: string,
+  {
+    fetchImpl = fetch,
+    signal,
+    retryDelaysMs = ICON_RETRY_DELAYS_MS,
+  }: { fetchImpl?: FetchImpl; signal?: AbortSignal; retryDelaysMs?: readonly number[] } = {},
+): Promise<string | null> {
+  const url = new URL(appIconUrl);
+  url.searchParams.set('bundleId', bundleId);
+  for (let attempt = 0; ; attempt++) {
+    const canRetry = attempt < retryDelaysMs.length;
+    let res: Response;
+    try {
+      res = await fetchImpl(url.toString(), { cache: 'no-store', signal });
+    } catch (err) {
+      if (signal?.aborted || !canRetry) throw err;
+      await delay(retryDelaysMs[attempt]!, signal);
+      continue;
+    }
+    if (res.ok) return parseAppIconResponse(await res.json());
+    if (res.status < 500 || !canRetry) {
+      throw new Error(`app icon request failed with ${res.status}`);
+    }
+    await delay(retryDelaysMs[attempt]!, signal);
+  }
+}
+
+function delay(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) return reject(signal.reason);
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(signal!.reason);
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    signal?.addEventListener('abort', onAbort, { once: true });
+  });
 }
 
 // Details (icon included) are immutable per installed build, so cache them
@@ -93,11 +156,12 @@ export function getIosAppDetails(
   run: RunHostAction,
   udid: string,
   bundleId: string,
+  options: { includeIcon?: boolean } = {},
 ): Promise<IosAppDetails | null> {
-  const key = `${udid}:${bundleId}`;
+  const key = `${udid}:${bundleId}:${options.includeIcon !== false}`;
   const cached = detailsCache.get(key);
   if (cached) return cached;
-  const pending = fetchIosAppDetails(run, udid, bundleId).catch((err) => {
+  const pending = fetchIosAppDetails(run, udid, bundleId, options).catch((err) => {
     detailsCache.delete(key);
     throw err;
   });
