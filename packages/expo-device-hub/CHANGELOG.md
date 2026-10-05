@@ -1,5 +1,11 @@
 # expo-device-hub
 
+## 0.15.1
+
+### Patch Changes
+
+- ffa6c99: Stream physical Android devices over scrcpy instead of inheriting the emulator-only `grpc-screenshot` default, and stop broadcasting `video-session` for scrcpy restarts that keep the same size, which sent WebCodecs viewers into a keyframe-reset loop.
+
 ## 0.15.0
 
 ### Minor Changes

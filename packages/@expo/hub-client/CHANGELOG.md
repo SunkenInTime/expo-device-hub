@@ -1,5 +1,11 @@
 # @expo/hub-client
 
+## 1.3.1
+
+### Patch Changes
+
+- a512bfe: Read the iOS foreground app icon from serve-sim's `/api/apps/icon` route when `/api` advertises `appIconEndpoint`, so a tunneled server shows the icon without the exec-ws socket. Older servers still get the icon over exec-ws.
+
 ## 1.3.0
 
 ### Minor Changes
