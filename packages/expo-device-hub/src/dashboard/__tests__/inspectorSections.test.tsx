@@ -152,6 +152,28 @@ function inspectorClient(platform: DevicePlatform): DeviceClient {
   };
 }
 
+test.each([
+  { h264: true, httpCodec: undefined, expected: 'H.264' },
+  { h264: false, httpCodec: undefined, expected: 'MJPEG' },
+  { h264: true, httpCodec: 'mjpeg' as const, expected: 'MJPEG' },
+  { h264: true, httpCodec: 'auto' as const, expected: 'Auto' },
+])('HTTP-only controls fall back from WebRTC with codec $expected (h264=$h264, httpCodec=$httpCodec)', ({ h264, httpCodec, expected }) => {
+  const client = {
+    ...inspectorClient('ios'),
+    streamCapabilities: {
+      modeAvailability: { mjpeg: true, h264: true, webrtc: false },
+      httpCodecs: ['auto', 'h264', 'mjpeg'] as const,
+      webRtcCodecs: [],
+    },
+  };
+  const html = renderToStaticMarkup(
+    <StreamOptionsSection client={client} defaultOpen streamMode="webrtc" httpCodec={httpCodec}
+      streamModeAvailability={{ mjpeg: true, h264, webrtc: true }} />,
+  );
+  expect(selectValue(html, 'Stream transport')).toBe('HTTP');
+  expect(selectValue(html, 'HTTP codec')).toBe(expected);
+});
+
 function device(platform: DevicePlatform, deviceFrame: Device['deviceFrame']): Device {
   return {
     id: `${platform}-device`,
@@ -1053,6 +1075,27 @@ test('hides WebRTC statistics when another transport is active', () => {
 
   expect(html).not.toContain('aria-label="WebRTC stream statistics"');
   expect(html).not.toContain('role="img"');
+});
+
+test('WebRTC-only iOS servers do not promise an MJPEG fallback in insecure browsers', () => {
+  const client = {
+    ...inspectorClient('ios'),
+    streamCapabilities: {
+      modeAvailability: { mjpeg: false, h264: false, webrtc: true },
+      httpCodecs: [],
+      webRtcCodecs: ['h264', 'vp9', 'vp8'],
+    },
+  } satisfies DeviceClient;
+  const html = renderToStaticMarkup(
+    <StreamOptionsSection
+      client={client}
+      defaultOpen
+      streamMode="webrtc"
+      streamModeAvailability={{ mjpeg: true, h264: false, webrtc: false }}
+    />,
+  );
+  expect(html).toContain('WebRTC requires localhost or HTTPS.');
+  expect(html).not.toContain('MJPEG remains available');
 });
 
 test('explains when the Android host was not launched with WebRTC', () => {

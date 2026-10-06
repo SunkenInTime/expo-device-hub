@@ -89,6 +89,7 @@ import { middlewareEndpointForBrowser, proxyPreviewConfigForBrowser } from './pr
 import { sessionTokenFetch, sessionTokenProtocols, withSessionTokenQuery } from './session-token';
 import { type ParsedSseBlock, drainSseChunk } from './sse';
 import { normalizeDeviceStreamSettings } from './stream-settings';
+import { resolveDeviceStreamMode } from './stream-mode';
 import { useAccessibility } from './useAccessibility';
 import { useAppPermissions } from './useAppPermissions';
 import { useAvccStream } from './useAvccStream';
@@ -141,9 +142,15 @@ const PLACEHOLDER_DEVICES: RunningDevice[] = [
   { id: 'ios', name: 'iPhone Simulator', platform: 'ios', current: true },
 ];
 
-const IOS_STREAM_CAPABILITIES = {
-  modeAvailability: { mjpeg: true, h264: true, webrtc: true },
+const IOS_HTTP_STREAM_CAPABILITIES = {
+  modeAvailability: { mjpeg: true, h264: true, webrtc: false },
   httpCodecs: ['auto', 'h264', 'mjpeg'],
+  webRtcCodecs: [],
+} as const satisfies DeviceStreamCapabilities;
+
+const IOS_WEBRTC_STREAM_CAPABILITIES = {
+  modeAvailability: { mjpeg: false, h264: false, webrtc: true },
+  httpCodecs: [],
   webRtcCodecs: ['h264', 'vp9', 'vp8'],
 } as const satisfies DeviceStreamCapabilities;
 
@@ -154,6 +161,19 @@ const IOS_STREAM_SETTING_CAPABILITIES = {
   h264Bitrate: true,
   h264Fps: true,
 } as const satisfies DeviceStreamSettingCapabilities;
+
+/**
+ * Stream modes for the transport serve-sim advertises in `/api`. serve-sim
+ * locks a WebRTC server to WebRTC and refuses its HTTP streams; a missing or
+ * unknown value is its HTTP default.
+ */
+export function iosStreamCapabilities(streamSettings: unknown): DeviceStreamCapabilities {
+  const transport =
+    streamSettings && typeof streamSettings === 'object'
+      ? (streamSettings as { transport?: unknown }).transport
+      : undefined;
+  return transport === 'webrtc' ? IOS_WEBRTC_STREAM_CAPABILITIES : IOS_HTTP_STREAM_CAPABILITIES;
+}
 
 // The counterclockwise rotation order (matches Simulator's "Rotate Left"): each
 // press advances one step, so four presses come back around to portrait.
@@ -217,9 +237,11 @@ interface ResolvedConfig {
   /** The helper sends `WS_MSG_INPUT_ADMITTED` to an admitted input socket. */
   inputAdmission: boolean;
   device: string | null;
+  pid: number | null;
   /** Middleware exec-ws URL used for logs, events, metrics, and UI requests. */
   execWsUrl: string | null;
   execToken: string | null;
+  configEventsPath: string;
   /** Relative SSE path to subscribe for logs, e.g. `/logs?device=<udid>`. */
   logsPath: string | null;
   /** Absolute URL of the foreground-app SSE stream. */
@@ -247,6 +269,7 @@ interface PreviewApi {
   wsUrl?: string;
   inputAdmission?: boolean;
   device?: string;
+  pid?: number;
   basePath?: string;
   execToken?: string;
   logsEndpoint?: string;
@@ -265,14 +288,32 @@ interface PreviewApi {
         Partial<DeviceStreamEncoderSettings>);
 }
 
-// The server, device, and token that one resolved config belongs to.
+// The requested server, device, and credentials that one resolved config belongs to.
 function connectionKey(baseUrl: string, device: string | null, token: string | null): string {
   return JSON.stringify([baseUrl, device, token]);
 }
 
+function configKey(config: ResolvedConfig): string {
+  const settings = config.initialStreamSettings as PreviewApi['streamSettings'];
+  return JSON.stringify({
+    ...config,
+    initialStreamSettings: {
+      ...normalizeDeviceStreamSettings(settings),
+      transport: settings?.transport ?? 'http',
+      codec: settings?.codec ?? 'h264',
+    },
+  });
+}
+
 /** @deprecated Use DeviceClientProvider with useDeviceClient or useDeviceScreenClient instead. */
 export function useIosDeviceClient(options: DeviceConnectionOptions): DeviceClient {
-  const { baseUrl, enabled = true, device: targetDevice = null, streamMode, token = null } = options;
+  const {
+    baseUrl,
+    enabled = true,
+    device: targetDevice = null,
+    streamMode: requestedStreamMode,
+    token = null,
+  } = options;
   const active = enabled && !!baseUrl;
   const sessionFetch = useMemo(() => sessionTokenFetch(token), [token]);
   const socketProtocols = useMemo(() => sessionTokenProtocols('ios', token), [token]);
@@ -298,12 +339,22 @@ export function useIosDeviceClient(options: DeviceConnectionOptions): DeviceClie
   // Effect cleanups still close the old connections with the credentials they opened them with.
   const [resolvedConfig, setResolvedConfig] = useState<{
     key: string;
-    config: ResolvedConfig;
+    config: ResolvedConfig | null;
+    middleware: Pick<ResolvedConfig, 'execWsUrl' | 'execToken' | 'configEventsPath'>;
   } | null>(null);
-  const config =
+  const connection =
     active && baseUrl && resolvedConfig?.key === connectionKey(baseUrl, targetDevice, token)
-      ? resolvedConfig.config
+      ? resolvedConfig
       : null;
+  const config = connection?.config ?? null;
+  const refreshConfigRef = useRef<(() => void) | null>(null);
+  const applyPreviewConfigRef = useRef<((value: PreviewApi | null) => void) | null>(null);
+  const configUpdatesReadyRef = useRef(false);
+  const streamCapabilities = config ? iosStreamCapabilities(config.initialStreamSettings) : null;
+  // Preserve supported viewer choices; map unavailable ones to the server's transport.
+  const streamMode = streamCapabilities
+    ? resolveDeviceStreamMode(requestedStreamMode, streamCapabilities.modeAvailability)
+    : requestedStreamMode;
   // The simulator's system dark/light setting. null until read.
   const [appearance, setAppearanceState] = useState<DeviceAppearance | null>(null);
   const [deviceSettings, setDeviceSettings] = useState<DeviceSettings | null>(null);
@@ -323,6 +374,7 @@ export function useIosDeviceClient(options: DeviceConnectionOptions): DeviceClie
   // Input that arrived while the helper socket was down; flushed on reconnect
   // (bounded, and stale entries are dropped — see `./ws-send-queue`).
   const pendingWsRef = useRef<QueuedWsMessage[]>([]);
+  const pendingWsDestinationRef = useRef<{ wsUrl: string; device: string | null } | null>(null);
   // Monotonic log id source, persisted across log-stream reconnects so ids stay
   // unique even though lines are kept (the stream effect may re-run).
   const logSeqRef = useRef(0);
@@ -333,7 +385,6 @@ export function useIosDeviceClient(options: DeviceConnectionOptions): DeviceClie
   const [avccFallback, dispatchAvccFallback] = useReducer(avccFallbackReducer, initialAvccFallback);
   const [webRtcCodec, setWebRtcCodecState] = useState<DeviceWebRtcCodec>('h264');
   const [activeWebRtcCodec, setActiveWebRtcCodec] = useState<WebRtcCodec>('h264');
-  const [webRtcHttpFallback, setWebRtcHttpFallback] = useState(false);
   const deviceSettingWriteTrackerRef = useRef(new KeyedWriteTracker<DeviceSettingKey>());
   // Async option writes capture their config. Track only committed config so
   // an interrupted concurrent render cannot invalidate a legitimate rollback.
@@ -342,12 +393,11 @@ export function useIosDeviceClient(options: DeviceConnectionOptions): DeviceClie
     deviceSettingConfigRef.current = config;
   }, [config]);
   const activityLastSampleAtRef = useRef(0);
-  const useWebRtc = streamMode === 'webrtc' && !webRtcHttpFallback;
-  const wantsAvcc = streamMode === 'h264' || webRtcHttpFallback;
+  const useWebRtc = streamMode === 'webrtc';
+  const wantsAvcc = streamMode === 'h264';
   const useAvcc = wantsAvcc && isAvccSupported() && !avccFallback.fellBack;
   useEffect(() => {
     if (streamMode === 'webrtc') return;
-    setWebRtcHttpFallback(false);
     setActiveWebRtcCodec(webRtcCodec);
   }, [streamMode, webRtcCodec]);
   // True while the in-flight single-finger drag began in the home-indicator band.
@@ -583,10 +633,9 @@ export function useIosDeviceClient(options: DeviceConnectionOptions): DeviceClie
     [setDeviceSetting],
   );
 
-  const setWebRtcCodec = useCallback((codec: DeviceWebRtcCodec) => {
+  const setInitialWebRtcCodec = useCallback((codec: DeviceWebRtcCodec) => {
     setWebRtcCodecState(codec);
     setActiveWebRtcCodec(codec);
-    setWebRtcHttpFallback(false);
   }, []);
 
   const attachLogs = useCallback(() => setLogsEnabled(true), []);
@@ -615,6 +664,10 @@ export function useIosDeviceClient(options: DeviceConnectionOptions): DeviceClie
     }
     let cancelled = false;
     let pollTimer: ReturnType<typeof setTimeout> | null = null;
+    let inFlight = false;
+    let revision = 0;
+    let current: ResolvedConfig | null = null;
+    let lastConfig: ResolvedConfig | null = null;
     setStatus('connecting');
     setError(null);
 
@@ -642,6 +695,8 @@ export function useIosDeviceClient(options: DeviceConnectionOptions): DeviceClie
         wsUrl: toQueryStyleHelperWsUrl(c.wsUrl ?? `${toWs(c.url!)}/ws`),
         inputAdmission: c.inputAdmission === true,
         device: c.device ?? null,
+        pid: c.pid ?? null,
+        configEventsPath: `${basePath}/api/events${targetDevice ? `?device=${encodeURIComponent(targetDevice)}` : ''}`,
         execWsUrl: toWs(absoluteMiddlewareUrl(`${basePath}/exec-ws`)!),
         execToken: c.execToken ?? null,
         // These are subscription paths inside exec-ws, not browser URLs. The
@@ -672,46 +727,110 @@ export function useIosDeviceClient(options: DeviceConnectionOptions): DeviceClie
     // run (i.e. per device). Resets whenever `targetDevice`/`baseUrl` change.
     let startRequested = false;
 
-    const resolve = async () => {
+    const applyConfig = (value: PreviewApi | null) => {
       if (cancelled) return;
+      const next = value?.url && value.device ? toMiddleware(value) : null;
+      revision++;
+      if (pollTimer) clearTimeout(pollTimer);
+      pollTimer = null;
+      if (!next) {
+        current = null;
+        // Keep the middleware subscription alive while its helper is absent.
+        setResolvedConfig((previous) =>
+          previous?.key === connectionKey(baseUrl, targetDevice, token)
+            ? { ...previous, config: null }
+            : previous,
+        );
+        setStatus('connecting');
+        setError(null);
+        pollTimer = setTimeout(resolve, RECONNECT_MS);
+        return;
+      }
+      if (current && configKey(current) === configKey(next)) return;
+      if (
+        current &&
+        JSON.stringify(current.webRtcIceServers) === JSON.stringify(next.webRtcIceServers)
+      ) {
+        next.webRtcIceServers = current.webRtcIceServers;
+      }
+      const previousTransport =
+        lastConfig && iosStreamCapabilities(lastConfig.initialStreamSettings);
+      const nextTransport = iosStreamCapabilities(next.initialStreamSettings);
+      if (
+        !lastConfig ||
+        lastConfig.device !== next.device ||
+        previousTransport?.modeAvailability.webrtc !== nextTransport.modeAvailability.webrtc ||
+        lastConfig.webRtcCodec !== next.webRtcCodec
+      ) {
+        setInitialWebRtcCodec(next.webRtcCodec);
+      }
+      current = next;
+      lastConfig = next;
+      setResolvedConfig({
+        key: connectionKey(baseUrl, targetDevice, token),
+        config: next,
+        middleware: {
+          execWsUrl: next.execWsUrl,
+          execToken: next.execToken,
+          configEventsPath: next.configEventsPath,
+        },
+      });
+    };
+
+    const resolve = async () => {
+      if (cancelled || inFlight) return;
+      if (pollTimer) clearTimeout(pollTimer);
+      pollTimer = null;
+      inFlight = true;
+      const requestRevision = revision;
       try {
-        const res = await sessionFetch(apiUrl, { signal: AbortSignal.timeout(3000) });
-        if (!res.ok) {
-          if (!cancelled) pollTimer = setTimeout(resolve, RECONNECT_MS);
-          return;
-        }
-        const c = (await res.json()) as PreviewApi | null;
-        if (c && c.url && c.device) {
-          if (!cancelled) {
-            const resolved = toMiddleware(c);
-            setWebRtcCodec(resolved.webRtcCodec);
-            setResolvedConfig({
-              key: connectionKey(baseUrl, targetDevice, token),
-              config: resolved,
-            });
-          }
-          return;
-        }
-        // Middleware reachable but no helper for this device yet. Ask the grid to
-        // start one (once): a booted sim just gets a stream daemon; a shut-down
-        // sim is booted. The middleware never does this on its own — only here,
-        // because the user selected this device. Then poll until it attaches.
-        if (targetDevice && !startRequested) {
+        const res = await sessionFetch(apiUrl, {
+          signal: AbortSignal.timeout(3000),
+          cache: 'no-store',
+        });
+        if (!res.ok) throw new Error(`Discovery failed: ${res.status}`);
+        const value = (await res.json()) as PreviewApi | null;
+        // A pushed update is newer than an HTTP request that was already in flight.
+        if (cancelled || requestRevision !== revision) return;
+        applyConfig(value);
+        if (!(value?.url && value.device) && targetDevice && !startRequested) {
           startRequested = true;
           void startIosHelper(targetDevice, baseUrl, sessionFetch).catch(() => {});
         }
-        if (!cancelled) pollTimer = setTimeout(resolve, RECONNECT_MS);
       } catch {
-        if (!cancelled) pollTimer = setTimeout(resolve, RECONNECT_MS);
+        // A failed background refresh must not tear down a working video stream.
+        if (!cancelled && requestRevision === revision)
+          pollTimer = setTimeout(resolve, RECONNECT_MS);
+      } finally {
+        inFlight = false;
       }
     };
-    void resolve();
+    const refresh = () => {
+      void resolve();
+    };
+    refreshConfigRef.current = refresh;
+    applyPreviewConfigRef.current = applyConfig;
+    refresh();
 
     return () => {
       cancelled = true;
       if (pollTimer) clearTimeout(pollTimer);
+      if (refreshConfigRef.current === refresh) refreshConfigRef.current = null;
+      if (applyPreviewConfigRef.current === applyConfig) applyPreviewConfigRef.current = null;
     };
-  }, [active, baseUrl, targetDevice, setWebRtcCodec, sessionFetch, token]);
+  }, [active, baseUrl, targetDevice, setInitialWebRtcCodec, sessionFetch, token]);
+
+  // A replacement helper/session at the same URL still needs new video readers.
+  const videoSessionKey = config
+    ? JSON.stringify([config.url, config.device, config.pid, config.execToken])
+    : null;
+  const videoFetch = useMemo(
+    () =>
+      videoSessionKey
+        ? (...args: Parameters<typeof sessionFetch>) => sessionFetch(...args)
+        : sessionFetch,
+    [sessionFetch, videoSessionKey],
+  );
 
   const fpsCounterRef = useRef({ frames: 0, startedAt: 0 });
   const onAvccFrame = useCallback((frameDelta = 1) => {
@@ -726,12 +845,13 @@ export function useIosDeviceClient(options: DeviceConnectionOptions): DeviceClie
     setFps((previous) => (previous === next ? previous : next));
   }, []);
 
-  // ── WebRTC with serve-sim's codec and HTTP fallback policy. ──
+  // ── WebRTC with codec retries, confined to the advertised transport. ──
   const {
     stream: webRtcStream,
     failure: webRtcFailure,
     error: webRtcError,
     markFrameDecoded: markWebRtcFrameDecoded,
+    restart: restartWebRtc,
     streamStats,
     setStreamStatsEnabled,
   } = useWebRtcStream({
@@ -742,30 +862,41 @@ export function useIosDeviceClient(options: DeviceConnectionOptions): DeviceClie
     enabled: active && useWebRtc && !!config,
     codec: activeWebRtcCodec,
     iceServers: config?.webRtcIceServers,
-    fetchImpl: sessionFetch,
+    fetchImpl: videoFetch,
   });
   const handledWebRtcFailureRef = useRef<string | null>(null);
+  const webRtcCodecsExhausted =
+    webRtcFailure?.kind === 'codec' &&
+    webRtcFallbackDecision(webRtcCodec, activeWebRtcCodec, webRtcFailure)?.type === 'switch-to-http';
+
+  const setWebRtcCodec = useCallback(
+    (codec: DeviceWebRtcCodec) => {
+      setInitialWebRtcCodec(codec);
+      // Selecting an already-active failed codec does not change the stream
+      // hook's inputs, so retry its session explicitly.
+      if (codec === activeWebRtcCodec && webRtcFailure) restartWebRtc();
+    },
+    [activeWebRtcCodec, webRtcFailure, restartWebRtc, setInitialWebRtcCodec],
+  );
 
   useEffect(() => {
     if (!useWebRtc || !webRtcFailure) return;
     if (handledWebRtcFailureRef.current === webRtcFailure.sessionId) return;
     handledWebRtcFailureRef.current = webRtcFailure.sessionId;
     const decision = webRtcFallbackDecision(webRtcCodec, activeWebRtcCodec, webRtcFailure);
-    if (!decision) return;
-    if (decision.type === 'switch-to-http') setWebRtcHttpFallback(true);
-    else setActiveWebRtcCodec(decision.codec);
+    if (decision?.type === 'retry-codec') setActiveWebRtcCodec(decision.codec);
   }, [useWebRtc, webRtcFailure, webRtcCodec, activeWebRtcCodec]);
 
   useEffect(() => {
     if (!useWebRtc) return;
-    if (webRtcError) {
+    if (webRtcError || webRtcCodecsExhausted) {
       setStatus('error');
-      setError(webRtcError);
+      setError(webRtcError ?? 'No supported WebRTC codec could establish a video stream.');
     } else if (!webRtcStream) {
       setStatus('connecting');
       setError(null);
     }
-  }, [useWebRtc, webRtcError, webRtcStream]);
+  }, [useWebRtc, webRtcError, webRtcStream, webRtcCodecsExhausted]);
 
   useEffect(() => {
     if (!useWebRtc) return;
@@ -834,21 +965,20 @@ export function useIosDeviceClient(options: DeviceConnectionOptions): DeviceClie
   // ── H.264 AVCC (WebCodecs) with serve-sim's MJPEG fallback policy. ──
   useEffect(() => {
     dispatchAvccFallback('reset');
-    setWebRtcHttpFallback(false);
     setFps(0);
-  }, [streamMode, config?.url, config?.webRtcCodec]);
+  }, [streamMode, videoSessionKey, config?.webRtcCodec]);
 
   useEffect(() => {
     if (!useAvcc || !config?.url) return;
     const timer = setTimeout(() => dispatchAvccFallback('timeout'), AVCC_FRAME_TIMEOUT_MS);
     return () => clearTimeout(timer);
-  }, [useAvcc, config?.url]);
+  }, [useAvcc, config?.url, videoSessionKey]);
 
   useAvccStream({
     url: config?.url ?? '',
     enabled: active && useAvcc && !!config,
     canvasRef,
-    fetchImpl: sessionFetch,
+    fetchImpl: videoFetch,
     onFirstFrame: () => {
       setStatus('streaming');
       setError(null);
@@ -933,16 +1063,33 @@ export function useIosDeviceClient(options: DeviceConnectionOptions): DeviceClie
       setScreen(null);
       setFps(0);
     };
-  }, [streamUrl, applyStreamSrc]);
+  }, [streamUrl, videoSessionKey, applyStreamSrc]);
 
   // ── Helper control WebSocket (touch/buttons out, screen config in) ──
   const wsUrl = config?.wsUrl ?? null;
   const inputAdmission = config?.inputAdmission === true;
+  const controlDevice = config?.device ?? null;
+  useEffect(() => {
+    pendingWsDestinationRef.current = null;
+    pendingWsRef.current = [];
+    return () => {
+      pendingWsRef.current = [];
+    };
+  }, [active, baseUrl, targetDevice, token]);
+
   useEffect(() => {
     setHardwareKeyboardConnectedState(null);
     setInputSocketError(null);
     setInputUnavailable(false);
     if (!wsUrl) return;
+    const previousDestination = pendingWsDestinationRef.current;
+    if (
+      previousDestination &&
+      (previousDestination.wsUrl !== wsUrl || previousDestination.device !== controlDevice)
+    ) {
+      pendingWsRef.current = [];
+    }
+    pendingWsDestinationRef.current = { wsUrl, device: controlDevice };
     let cancelled = false;
     let retryTimer: ReturnType<typeof setTimeout> | null = null;
     let admissionTimer: ReturnType<typeof setTimeout> | null = null;
@@ -967,8 +1114,9 @@ export function useIosDeviceClient(options: DeviceConnectionOptions): DeviceClie
       ws.binaryType = 'arraybuffer';
       wsRef.current = ws;
       ws.onopen = () => {
+        if (cancelled) return;
         // Older servers have no admission frame and may have no screen config yet.
-        if (!cancelled && !inputAdmission) {
+        if (!inputAdmission) {
           admissionTimer = setTimeout(admitInput, INPUT_ADMISSION_MS);
         }
         // Deliver whatever the user did while the socket was down.
@@ -1014,7 +1162,13 @@ export function useIosDeviceClient(options: DeviceConnectionOptions): DeviceClie
         admissionTimer = null;
         const rejection = iosInputCloseError(event.code, event.reason);
         if (rejection) setInputSocketError(rejection);
-        retryTimer = setTimeout(connect, RECONNECT_MS);
+        retryTimer = setTimeout(() => {
+          if (cancelled) return;
+          connect();
+          // Normally exec-ws pushes replacement config. HTTP discovery recovers
+          // rotated credentials or a proxy that cannot upgrade WebSockets.
+          if (!configUpdatesReadyRef.current) refreshConfigRef.current?.();
+        }, RECONNECT_MS);
       };
       ws.onerror = () => {
         try {
@@ -1032,17 +1186,18 @@ export function useIosDeviceClient(options: DeviceConnectionOptions): DeviceClie
         wsRef.current?.close();
       } catch {}
       wsRef.current = null;
-      // Queued input was for this device; don't replay it on the next one.
-      pendingWsRef.current = [];
+      // Keep fresh input across rediscovery; connection/device changes clear
+      // it above, and the queue drops expired messages before delivery.
       setHardwareKeyboardConnectedState(null);
     };
-  }, [wsUrl, inputAdmission, sendWs, socketProtocols]);
+  }, [wsUrl, inputAdmission, controlDevice, sendWs, socketProtocols, videoSessionKey]);
 
   // ── Long-lived middleware SSE routes multiplexed over one authenticated
   //    exec-ws, matching serve-sim's browser client. Keeping logs, events, and
   //    metrics off separate HTTP streams avoids the per-origin connection cap. ──
-  const execWsUrl = config?.execWsUrl ?? null;
-  const execToken = config?.execToken ?? null;
+  const execWsUrl = connection?.middleware.execWsUrl ?? null;
+  const execToken = connection?.middleware.execToken ?? null;
+  const configEventsPath = connection?.middleware.configEventsPath ?? null;
   const logsPath = config?.logsPath ?? null;
   const eventsPath = config?.eventsPath ?? null;
   const metricsPath = config?.metricsPath ?? null;
@@ -1107,8 +1262,12 @@ export function useIosDeviceClient(options: DeviceConnectionOptions): DeviceClie
 
   useEffect(() => {
     if (!execWsUrl || !execToken) return;
-    const subscriptions = new Map<number, 'logs' | 'events' | 'metrics'>();
+    const subscriptions = new Map<number, 'logs' | 'events' | 'metrics' | 'config'>();
     const paths = new Map<number, string>();
+    if (configEventsPath) {
+      subscriptions.set(4, 'config');
+      paths.set(4, configEventsPath);
+    }
     if (logsEnabled && logsPath) {
       subscriptions.set(1, 'logs');
       paths.set(1, logsPath);
@@ -1134,7 +1293,15 @@ export function useIosDeviceClient(options: DeviceConnectionOptions): DeviceClie
       }
     };
 
-    const emit = (kind: 'logs' | 'events' | 'metrics', block: ParsedSseBlock) => {
+    const emit = (kind: 'logs' | 'events' | 'metrics' | 'config', block: ParsedSseBlock) => {
+      if (kind === 'config') {
+        try {
+          const value = JSON.parse(block.data) as PreviewApi | null;
+          applyPreviewConfigRef.current?.(value);
+          configUpdatesReadyRef.current = true;
+        } catch {}
+        return;
+      }
       if (kind === 'logs') {
         let message = block.data;
         try {
@@ -1185,12 +1352,18 @@ export function useIosDeviceClient(options: DeviceConnectionOptions): DeviceClie
       try {
         ws = new WebSocket(execWsUrl, socketProtocols);
       } catch {
+        configUpdatesReadyRef.current = false;
         markInterrupted();
-        retryTimer = setTimeout(connect, RECONNECT_MS);
+        retryTimer = setTimeout(() => {
+          if (cancelled) return;
+          connect();
+          refreshConfigRef.current?.();
+        }, RECONNECT_MS);
         return;
       }
       ws.onopen = () => ws?.send(JSON.stringify({ token: execToken }));
       ws.onmessage = (event) => {
+        if (cancelled) return;
         let msg: { ready?: boolean; sub?: number; data?: string; end?: boolean };
         try {
           msg = JSON.parse(String(event.data));
@@ -1220,8 +1393,13 @@ export function useIosDeviceClient(options: DeviceConnectionOptions): DeviceClie
       };
       ws.onclose = () => {
         if (!cancelled) {
+          configUpdatesReadyRef.current = false;
           markInterrupted();
-          retryTimer = setTimeout(connect, RECONNECT_MS);
+          retryTimer = setTimeout(() => {
+            if (cancelled) return;
+            connect();
+            refreshConfigRef.current?.();
+          }, RECONNECT_MS);
         }
       };
       ws.onerror = () => {
@@ -1234,6 +1412,7 @@ export function useIosDeviceClient(options: DeviceConnectionOptions): DeviceClie
 
     return () => {
       cancelled = true;
+      configUpdatesReadyRef.current = false;
       if (retryTimer) clearTimeout(retryTimer);
       try {
         ws?.close();
@@ -1244,6 +1423,7 @@ export function useIosDeviceClient(options: DeviceConnectionOptions): DeviceClie
     eventsEnabled,
     execWsUrl,
     execToken,
+    configEventsPath,
     logsPath,
     eventsPath,
     metricsPath,
@@ -1476,7 +1656,7 @@ export function useIosDeviceClient(options: DeviceConnectionOptions): DeviceClie
     setLocation,
     clearLocation,
     ...appPermissions,
-    streamCapabilities: IOS_STREAM_CAPABILITIES,
+    streamCapabilities,
     screenRecording: null,
     streamSettings,
     streamSettingsPending,
