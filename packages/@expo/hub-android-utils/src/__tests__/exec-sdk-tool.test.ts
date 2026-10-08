@@ -41,8 +41,16 @@ describe("buildBatchCommand", () => {
     );
   });
 
-  test("escapes embedded double quotes", () => {
-    expect(buildBatchCommand("tool.bat", ['say "hi"'])).toBe('tool.bat "say ""hi"""');
+  test("rejects arguments with characters cmd.exe acts on inside quotes", () => {
+    for (const arg of ["100%", "a!b", "a^b", 'say "hi"', "a\nb", "a\r\nb"]) {
+      expect(() => buildBatchCommand("tool.bat", ["create", arg])).toThrow("Refusing");
+    }
+  });
+
+  test("still runs a tool under a home folder named with those characters", () => {
+    expect(buildBatchCommand("C:\\Users\\a^b\\sdk\\avdmanager.bat", ["list", "avd"])).toBe(
+      '"C:\\Users\\a^b\\sdk\\avdmanager.bat" list avd',
+    );
   });
 });
 
@@ -72,11 +80,12 @@ describe("execSdkTool", () => {
         "--package",
         "system-images;android-36.1;google_apis_playstore;x86_64",
         "--device",
-        "pixel 6",
+        "3.2in HVGA slider (ADP1)",
       ]);
 
       expect(stdout.trim()).toBe(
-        '--package "system-images;android-36.1;google_apis_playstore;x86_64" --device "pixel 6"',
+        '--package "system-images;android-36.1;google_apis_playstore;x86_64" ' +
+          '--device "3.2in HVGA slider (ADP1)"',
       );
     });
   });
